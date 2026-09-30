@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="sv">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pianissimo Live Subs</title>
+  <style>
+    :root { color-scheme: normal; background: #00ff00; }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    body { background: #00ff00; font-family: Arial, Helvetica, sans-serif; }
+    #caption {
+      position: fixed;
+      left: 7%;
+      right: 7%;
+      bottom: 6%;
+      margin: 0;
+      color: #fff;
+      font-size: clamp(24px, 2.7vw, 58px);
+      line-height: 1.25;
+      font-weight: 700;
+      text-align: center;
+      overflow-wrap: anywhere;
+      -webkit-text-stroke: 1.5px #000;
+      paint-order: stroke fill;
+      text-shadow: 0 2px 2px #000, 1px 0 #000, -1px 0 #000, 0 -1px #000;
+    }
+    #caption[hidden] { display: none; }
+  </style>
+</head>
+<body>
+  <p id="caption" aria-live="polite" hidden></p>
+  <script>
+    "use strict";
+    const caption = document.getElementById("caption");
+    let currentText = "";
+    let currentId = null;
+    let expiryTimer;
+    let retryTimer;
+    let socket;
+    let retryDelay = 1000;
+    let disposed = false;
+
+    function clearCaption() {
+      clearTimeout(expiryTimer);
+      currentText = "";
+      currentId = null;
+      caption.textContent = "";
+      caption.hidden = true;
+    }
+
+    function fitCaption() {
+      if (!currentText) return;
+      caption.hidden = false;
+      caption.textContent = currentText;
+      const maximumHeight = parseFloat(getComputedStyle(caption).lineHeight) * 2;
+      const tooTall = () => caption.scrollHeight > maximumHeight + 1;
+      const words = currentText.split(" ");
+      while (tooTall() && words.length > 1) {
+        words.shift();
+        caption.textContent = "… " + words.join(" ");
+      }
+      // An unusually long single word must also preserve its newest characters.
+      let tail = words.join(" ");
+      while (tooTall() && tail.length > 1) {
+        tail = tail.slice(1);
+        caption.textContent = "… " + tail;
+      }
+    }
+
+    function connect() {
+      if (disposed) return;
+      const connection = new WebSocket(
+        (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/subtitles"
+      );
+      socket = connection;
+      connection.onopen = () => { retryDelay = 1000; };
+      connection.onmessage = (event) => {
+        if (disposed || socket !== connection) return;
+        try {
+          const message = JSON.parse(event.data);
+          if (message.type === "clear") return clearCaption();
+          if (message.type !== "transcription" || typeof message.data?.text !== "string") return;
+          const text = message.data.text.trim().replace(/\s+/g, " ");
+          if (!text) {
+            if (message.data.id === currentId) clearCaption();
+            return;
+          }
+          let lifetime = Number.isFinite(message.expires_in_ms)
+            ? Math.max(0, Math.min(8000, message.expires_in_ms)) : 8000;
+          if (Number.isFinite(message.expires_at)) {
+            const expiresAt = message.expires_at < 1e12 ? message.expires_at * 1000 : message.expires_at;
+            lifetime = Math.max(0, Math.min(lifetime, expiresAt - Date.now()));
+          }
+          if (!lifetime) return clearCaption();
+          clearTimeout(expiryTimer);
+          currentText = text;
+          currentId = message.data.id;
+          fitCaption();
+          expiryTimer = setTimeout(clearCaption, lifetime);
+        } catch { /* Transport diagnostics must never appear on air. */ }
+      };
+      connection.onerror = () => connection.close();
+      connection.onclose = () => {
+        if (disposed || socket !== connection) return;
+        clearCaption();
+        retryTimer = setTimeout(connect, retryDelay);
+        retryDelay = Math.min(retryDelay * 2, 5000);
+      };
+    }
+
+    const observer = new ResizeObserver(fitCaption);
+    observer.observe(document.documentElement);
+    window.addEventListener("pagehide", () => {
+      disposed = true;
+      clearTimeout(retryTimer);
+      clearCaption();
+      observer.disconnect();
+      socket?.close();
+    });
+    connect();
+  </script>
+</body>
+</html>

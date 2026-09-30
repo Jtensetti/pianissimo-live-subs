@@ -10,7 +10,7 @@ Installera **Python 3.11 med Python Launcher** en gång. Öppna cmd i projektmap
 start.cmd
 ```
 
-Första starten installerar Python-paketen i `.venv` och hämtar modellen (cirka 660 MB). Senare starter återanvänder filerna. Programmet använder standardmikrofonen. **Ctrl+C stoppar.** Tryck en gång till för direkt avbrott om en modellkörning eller nedladdning fastnat. Ingen Node.js, kontrollpanel eller separat webbbyggnad behövs.
+Första starten installerar Python-paketen i `.venv` och hämtar modellen (cirka 660 MB). Senare starter återanvänder filerna. När modellen är klar öppnas den gröna textsidan i din vanliga webbläsare. Programmet använder standardmikrofonen. **Ctrl+C stoppar.** Tryck en gång till för direkt avbrott om en modellkörning eller nedladdning fastnat. Ingen Node.js, kontrollpanel eller separat webbbyggnad behövs.
 
 ## OBS
 
@@ -19,6 +19,8 @@ Första starten installerar Python-paketen i `.venv` och hämtar modellen (cirka
 3. Öppna källans **Filter**, lägg till **Chroma Key** och välj **grön** nyckelfärg.
 
 Det är en webbläsarkälla med ett OBS-filter, inte ett separat OBS-plugin. Sidan visar bara en grön bakgrund och text med svart kontur längst ned. OBS-sidan behöver inte mikrofonåtkomst; cmd-programmet läser mikrofonen. Låt cmd-fönstret vara öppet under sändningen.
+
+Källan måste läggas till i OBS en gång; att sidan öppnas i webbläsaren gör inte att den automatiskt visas i OBS. När källan är på plats kan du starta med `start.cmd --no-browser` för att bara visa texten i OBS.
 
 ## Välj en annan mikrofon
 

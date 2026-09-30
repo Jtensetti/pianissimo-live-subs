@@ -6,6 +6,7 @@ from contextlib import contextmanager
 import os
 import signal
 import sys
+import webbrowser
 
 
 def arguments():
@@ -14,7 +15,17 @@ def arguments():
     parser.add_argument("--device", help="Mikrofonens nummer eller del av namnet (standard: systemets mikrofon).")
     parser.add_argument("--threads", type=int, default=4, choices=range(1, 17), metavar="1–16", help="CPU-trådar, standard 4.")
     parser.add_argument("--no-microphone", action="store_true", help="Starta server och modell utan mikrofon (för test).")
+    parser.add_argument("--no-browser", action="store_true", help="Öppna inte webbläsaren (om du bara använder OBS).")
     return parser.parse_args()
+
+
+async def open_overlay():
+    try:
+        opened = await asyncio.to_thread(webbrowser.open, "http://localhost:8000", new=2)
+    except Exception:
+        opened = False
+    if not opened:
+        print("Öppna http://localhost:8000 i webbläsaren för att se texten.", flush=True)
 
 
 async def run(args):
@@ -66,6 +77,10 @@ async def run(args):
         if args.no_microphone:
             await stop.wait()
         elif not stop.is_set():
+            if not args.no_browser:
+                await open_overlay()
+            if stop.is_set():
+                return
             device = int(args.device) if args.device and args.device.isdecimal() else args.device
             try:
                 await capture_microphone(device, stop, lambda: app.state.hub.publish({"type": "clear"}))

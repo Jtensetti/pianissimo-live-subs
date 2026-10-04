@@ -33,8 +33,8 @@
   <script>
     "use strict";
     const caption = document.getElementById("caption");
+    const segments = new Map();
     let currentText = "";
-    let currentId = null;
     let expiryTimer;
     let retryTimer;
     let socket;
@@ -43,10 +43,27 @@
 
     function clearCaption() {
       clearTimeout(expiryTimer);
+      segments.clear();
       currentText = "";
-      currentId = null;
       caption.textContent = "";
       caption.hidden = true;
+    }
+
+    function renderCaptions() {
+      clearTimeout(expiryTimer);
+      const now = Date.now();
+      for (const [id, segment] of segments) {
+        if (segment.expiresAt <= now) segments.delete(id);
+      }
+      currentText = Array.from(segments.values(), (segment) => segment.text).join(" ");
+      if (!currentText) {
+        caption.textContent = "";
+        caption.hidden = true;
+        return;
+      }
+      fitCaption();
+      const nextExpiry = Math.min(...Array.from(segments.values(), (segment) => segment.expiresAt));
+      expiryTimer = setTimeout(renderCaptions, Math.max(0, nextExpiry - now));
     }
 
     function fitCaption() {
@@ -80,10 +97,15 @@
         try {
           const message = JSON.parse(event.data);
           if (message.type === "clear") return clearCaption();
-          if (message.type !== "transcription" || typeof message.data?.text !== "string") return;
+          if (message.type !== "transcription" || typeof message.data?.text !== "string"
+              || typeof message.data.id !== "string") return;
+          const id = message.data.id;
           const text = message.data.text.trim().replace(/\s+/g, " ");
           if (!text) {
-            if (message.data.id === currentId) clearCaption();
+            if (message.mode === "final") {
+              segments.delete(id);
+              renderCaptions();
+            }
             return;
           }
           let lifetime = Number.isFinite(message.expires_in_ms)
@@ -92,12 +114,14 @@
             const expiresAt = message.expires_at < 1e12 ? message.expires_at * 1000 : message.expires_at;
             lifetime = Math.max(0, Math.min(lifetime, expiresAt - Date.now()));
           }
-          if (!lifetime) return clearCaption();
-          clearTimeout(expiryTimer);
-          currentText = text;
-          currentId = message.data.id;
-          fitCaption();
-          expiryTimer = setTimeout(clearCaption, lifetime);
+          if (!lifetime) segments.delete(id);
+          else {
+            // Same-ID corrections keep their place; new speech appears now,
+            // with the preceding segment as context rather than a display queue.
+            segments.set(id, { text, expiresAt: Date.now() + lifetime });
+            while (segments.size > 2) segments.delete(segments.keys().next().value);
+          }
+          renderCaptions();
         } catch { /* Transport diagnostics must never appear on air. */ }
       };
       connection.onerror = () => connection.close();

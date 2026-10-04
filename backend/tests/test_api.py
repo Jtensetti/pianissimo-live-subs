@@ -150,6 +150,109 @@ def test_stop_flushes_final_short_tail_and_releases_producer():
         assert app.state.producer is None
 
 
+def test_timed_continuation_repairs_cut_word_without_changing_caption_id():
+    from types import SimpleNamespace
+    class TimedModel:
+        calls = 0
+        def recognize(self, audio, sample_rate):
+            self.calls += 1
+            if self.calls == 1:
+                return SimpleNamespace(text="Vi samlas under middagsbjud",
+                                       tokens=[" Vi", " samlas", " under", " middags", "bjud"],
+                                       timestamps=[.5, 6.96, 7.28, 7.52, 7.84])
+            return SimpleNamespace(text="samlas under middagsbjudningen och pratar.",
+                                   tokens=[" samlas", " under", " middags", "bjud", "ningen", " och", " pratar", "."],
+                                   timestamps=[.16, .48, .72, 1.04, 1.2, 1.36, 1.6, 1.84])
+    with TestClient(create_app(ready_service(TimedModel()))) as client:
+        with client.websocket_connect("/ws/transcribe?instant=false") as ws:
+            ws.receive_json()
+            send_sound(ws, 8)
+            first = ws.receive_json()
+            send_sound(ws, .8)
+            ws.send_json({"type": "stop"})
+            second = ws.receive_json()
+            assert second["data"]["id"] == first["data"]["id"]
+            assert second["data"]["text"] == "Vi samlas under middagsbjudningen och pratar."
+            assert second["data"]["start"] == 0
+            assert second["data"]["end"] == 8.8
+            assert second["metrics"]["queue_ms"] >= 0
+            assert ws.receive_json()["type"] == "stopped"
+
+
+def test_clear_does_not_stitch_the_next_utterance_to_previous_final():
+    with TestClient(create_app(ready_service())) as client:
+        with client.websocket_connect("/ws/transcribe?instant=false") as ws:
+            ws.receive_json()
+            send_sound(ws, 8)
+            old = ws.receive_json()
+            ws.send_json({"type": "clear"})
+            assert ws.receive_json()["type"] == "clear"
+            send_sound(ws, .3)
+            ws.send_json({"type": "stop"})
+            new = ws.receive_json()
+            assert new["data"]["id"] != old["data"]["id"]
+            assert new["data"]["text"] == "Svensk text 2"
+            assert ws.receive_json()["type"] == "stopped"
+
+
+def test_empty_continuation_does_not_keep_previous_text_alive():
+    class EmptyContinuation:
+        calls = 0
+        def recognize(self, *_args, **_kwargs):
+            self.calls += 1
+            return "En riktig fras." if self.calls == 1 else ""
+    with TestClient(create_app(ready_service(EmptyContinuation()))) as client:
+        with client.websocket_connect("/ws/transcribe?instant=false") as ws:
+            ws.receive_json()
+            send_sound(ws, 8)
+            first = ws.receive_json()
+            send_sound(ws, .3)
+            ws.send_json({"type": "stop"})
+            second = ws.receive_json()
+            assert second["data"]["text"] == first["data"]["text"]
+            assert second["expires_at"] == first["expires_at"]
+            assert second["expires_in_ms"] <= first["expires_in_ms"]
+            assert ws.receive_json()["type"] == "stopped"
+
+
+def test_repeated_unchanged_hypothesis_does_not_renew_display_lifetime():
+    class ConstantModel:
+        def recognize(self, *_args, **_kwargs):
+            return "Samma hypotes."
+    with TestClient(create_app(ready_service(ConstantModel()))) as client:
+        with client.websocket_connect("/ws/transcribe") as ws:
+            ws.receive_json()
+            send_sound(ws, 1.2)
+            first = ws.receive_json()
+            send_sound(ws, .6)
+            second = ws.receive_json()
+            assert second["expires_at"] == first["expires_at"]
+            ws.send_json({"type": "stop"})
+            final = ws.receive_json()
+            assert final["expires_at"] == first["expires_at"]
+            assert ws.receive_json()["type"] == "stopped"
+
+
+@pytest.mark.parametrize("precision,expected", [("int8", "int8"), ("fp16", "fp16"), ("fp32", None)])
+def test_precision_selects_correct_model_files_and_timestamp_adapter(monkeypatch, precision, expected):
+    import onnx_asr
+    calls = []
+    timestamped_model = object()
+    class LoadedModel:
+        def with_timestamps(self):
+            return timestamped_model
+    def load(model_id, **kwargs):
+        calls.append((model_id, kwargs))
+        return LoadedModel()
+    monkeypatch.setattr(onnx_asr, "load_model", load)
+    service = ModelService(precision=precision)
+    assert service._load() is timestamped_model
+    assert calls[0][0] == "KlangAI/pianissimo-sv-onnx"
+    assert calls[0][1]["quantization"] == expected
+    assert calls[0][1]["providers"] == ["CPUExecutionProvider"]
+    assert service.snapshot()["quantization"] == precision
+
+
 def test_second_producer_rejected_but_passive_observers_allowed():
     with TestClient(create_app(ready_service())) as client:
         with client.websocket_connect("/ws/transcribe") as first:
@@ -254,6 +357,19 @@ def test_caption_snapshots_expire_and_retain_remaining_lifetime(monkeypatch):
     clock[0] = 103
     assert hub.snapshot()[0]["expires_in_ms"] == 5000
     clock[0] = 109
+    assert hub.snapshot() == []
+
+
+def test_republishing_old_expiry_does_not_revive_a_caption_for_reconnecting_obs(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr("backend.main.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("backend.main.time.time", lambda: clock[0])
+    hub = SubtitleHub()
+    event = {"type": "transcription", "mode": "final", "data": {"id": "x", "text": "Hej"}, "expires_at": 105.0}
+    hub.publish(event)
+    assert hub.snapshot()[0]["expires_in_ms"] == 5000
+    clock[0] = 106
+    hub.publish(event)
     assert hub.snapshot() == []
 
 

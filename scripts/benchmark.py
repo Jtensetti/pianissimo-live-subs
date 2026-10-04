@@ -24,6 +24,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("wav", type=Path, help="Mono 16-bit PCM WAV file")
     parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--precision", choices=("int8", "fp16", "fp32"), default="int8")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument(
         "--seconds", type=float, nargs="+", default=[2, 4, 0],
@@ -61,16 +62,17 @@ def main() -> None:
     options.intra_op_num_threads = args.threads
     options.inter_op_num_threads = 1
     model_id = "KlangAI/pianissimo-sv-onnx"
-    print("Loading Pianissimo int8 on CPU...", flush=True)
+    print(f"Loading Pianissimo {args.precision} on CPU...", flush=True)
     started = time.perf_counter()
     model = onnx_asr.load_model(
-        model_id, quantization="int8", providers=["CPUExecutionProvider"],
+        model_id, quantization=None if args.precision == "fp32" else args.precision,
+        providers=["CPUExecutionProvider"],
         sess_options=options,
     )
     load_seconds = time.perf_counter() - started
     report = {
         "model": model_id,
-        "quantization": "int8",
+        "quantization": args.precision,
         "provider": "CPUExecutionProvider",
         "threads": args.threads,
         "repeats": args.repeats,

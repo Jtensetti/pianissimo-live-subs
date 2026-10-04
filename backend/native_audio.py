@@ -53,7 +53,7 @@ class CaptureBuffer:
         return packet.samples
 
 
-async def capture_microphone(device, stop_event, clear_overlay):
+async def capture_microphone(device, stop_event, clear_overlay, *, sensitivity=4, diagnostics=False):
     """Capture until Ctrl+C or an explicit error; never automatically restart."""
     import sounddevice as sd
     import soxr
@@ -74,7 +74,7 @@ async def capture_microphone(device, stop_event, clear_overlay):
                             blocksize=round(rate * .1), callback=callback)
     sender = receiver = None
     try:
-        async with connect("ws://127.0.0.1:8000/ws/transcribe?model=pianissimo&instant=true",
+        async with connect(f"ws://127.0.0.1:8000/ws/transcribe?model=pianissimo&instant=true&vad={sensitivity}",
                            compression=None, max_queue=8, write_limit=16000, close_timeout=1) as ws:
             ready = json.loads(await ws.recv())
             if ready.get("type") != "ready":
@@ -96,9 +96,18 @@ async def capture_microphone(device, stop_event, clear_overlay):
                         raise CaptureError("Ljudöverföringen tog för lång tid. Inspelningen har stoppats.") from exc
 
             async def send_audio():
+                level_report = time.monotonic()
+                peak_rms = 0.0
                 while not stop_event.is_set():
                     audio = buffer.pop()
                     if audio is not None:
+                        if diagnostics:
+                            peak_rms = max(peak_rms, float(np.sqrt(np.mean(audio * audio))))
+                            if time.monotonic() - level_report >= 5:
+                                dbfs = 20 * np.log10(max(peak_rms, 1e-8))
+                                print(f"Ljudnivå: {dbfs:.0f} dBFS (högsta RMS senaste 5 s); känslighet {sensitivity}/5.", flush=True)
+                                peak_rms = 0.0
+                                level_report = time.monotonic()
                         await send_samples(resampler.resample_chunk(audio))
                     elif not stream.active:
                         raise CaptureError("Mikrofonen har stannat oväntat.")
@@ -119,6 +128,11 @@ async def capture_microphone(device, stop_event, clear_overlay):
                         raise CaptureError(event.get("message", "Transkriberingen har stoppats."))
                     if event.get("type") == "stopped":
                         return
+                    if diagnostics and event.get("type") == "transcription" and event.get("mode") == "final":
+                        metrics = event.get("metrics", {})
+                        print(f"Textning: {metrics.get('audio_seconds', 0):g} s ljud; "
+                              f"beräkning {metrics.get('inference_ms', 0):.0f} ms; "
+                              f"kö {metrics.get('queue_ms', 0):.0f} ms.", flush=True)
                 raise CaptureError("Anslutningen till transkriberingen stängdes.")
 
             sender = asyncio.create_task(send_audio())

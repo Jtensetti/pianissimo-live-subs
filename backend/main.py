@@ -22,9 +22,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
 try:
-    from .audio import AudioProtocolError, JobBuffer, Overloaded, Segmenter, decode_audio, trim_overlap
+    from .audio import AudioProtocolError, JobBuffer, Overloaded, Segmenter, decode_audio
+    from .transcript import from_result, stitch
 except ImportError:  # python backend/main.py
-    from audio import AudioProtocolError, JobBuffer, Overloaded, Segmenter, decode_audio, trim_overlap
+    from audio import AudioProtocolError, JobBuffer, Overloaded, Segmenter, decode_audio
+    from transcript import from_result, stitch
 
 logger = logging.getLogger(__name__)
 MODEL_ID = "KlangAI/pianissimo-sv-onnx"
@@ -34,15 +36,17 @@ MAX_INFERENCE_AGE = 3.0
 
 
 class ModelService:
-    def __init__(self, loader=None):
+    def __init__(self, loader=None, *, precision=None):
+        self.precision = precision or os.environ.get("PIANISSIMO_PRECISION", "int8")
+        if self.precision not in {"int8", "fp16", "fp32"}:
+            raise ValueError("Modellprecision måste vara int8, fp16 eller fp32.")
         self.model = None
         self.status = "not_loaded"
         self.error = None
         self.load_task = None
         self.loader = loader or self._load
 
-    @staticmethod
-    def _load():
+    def _load(self):
         import onnx_asr
         import onnxruntime as ort
 
@@ -50,16 +54,17 @@ class ModelService:
         session_options.intra_op_num_threads = CPU_THREADS
         session_options.inter_op_num_threads = 1
         return onnx_asr.load_model(
-            MODEL_ID, quantization="int8", providers=["CPUExecutionProvider"],
+            MODEL_ID, quantization=None if self.precision == "fp32" else self.precision,
+            providers=["CPUExecutionProvider"],
             sess_options=session_options,
-        )
+        ).with_timestamps()
 
     def snapshot(self):
         return {
             "model": "pianissimo", "model_id": MODEL_ID, "is_loaded": self.model is not None,
             # Loading can download on first use; exact byte progress is unavailable.
             "is_downloading": self.status == "loading", "status": self.status,
-            "error": self.error, "device": "cpu", "quantization": "int8",
+            "error": self.error, "device": "cpu", "quantization": self.precision,
             "cpu_threads": CPU_THREADS, "cache_dir": os.environ["HF_HUB_CACHE"],
             "offline": os.environ.get("HF_HUB_OFFLINE", "").lower() in {"1", "true", "yes", "on"},
         }
@@ -83,7 +88,7 @@ class ModelService:
     def recognize(self, audio):
         if self.model is None:
             raise RuntimeError("Pianissimo är inte laddad.")
-        return self.model.recognize(audio, sample_rate=16000).strip()
+        return self.model.recognize(audio, sample_rate=16000)
 
 
 class SubtitleHub:
@@ -95,7 +100,10 @@ class SubtitleHub:
         if event["type"] == "clear":
             self.latest.clear()
         elif event["type"] == "transcription":
-            self.latest[event["data"]["id"]] = (time.monotonic(), event)
+            remaining = CAPTION_TTL
+            if "expires_at" in event:
+                remaining = max(0, min(CAPTION_TTL, event["expires_at"] - time.time()))
+            self.latest[event["data"]["id"]] = (time.monotonic() - (CAPTION_TTL - remaining), event)
             while len(self.latest) > 2:
                 self.latest.popitem(last=False)
         for queue in tuple(self.listeners):
@@ -205,7 +213,7 @@ def create_app(service=None, *, max_inference_age=MAX_INFERENCE_AGE):
             app.state.hub.listeners.discard(queue)
 
     @app.websocket("/ws/transcribe")
-    async def transcribe(ws: WebSocket, model: str = "pianissimo", vad: int = Query(3), instant: bool = True):
+    async def transcribe(ws: WebSocket, model: str = "pianissimo", vad: int = Query(4), instant: bool = True):
         if not await accept_local(ws):
             return
 
@@ -239,38 +247,66 @@ def create_app(service=None, *, max_inference_age=MAX_INFERENCE_AGE):
 
         async def worker():
             nonlocal inference_task
-            previous_final = ""
+            previous_final = None
+            previous_end = 0.0
+            previous_generation = None
+            caption_id = None
+            caption_start = 0.0
+            previous_expiry = 0.0
+            last_published = None
             while (job := await jobs.get()) is not None:
                 remaining = job.created_at + max_inference_age - time.monotonic()
                 if remaining <= 0:
                     raise latency_error()
                 started = time.perf_counter()
+                queue_ms = max(0, (time.monotonic() - job.created_at) * 1000)
                 # Shield the native inference task: a timeout must notify the user
                 # immediately, but Python cannot cancel ONNX's running native thread.
                 # The endpoint retains ownership and awaits it only after error/close.
                 inference_task = asyncio.create_task(asyncio.to_thread(app.state.service.recognize, job.audio))
                 try:
-                    text = await asyncio.wait_for(asyncio.shield(inference_task), timeout=remaining)
+                    result = await asyncio.wait_for(asyncio.shield(inference_task), timeout=remaining)
                 except TimeoutError as exc:
                     raise latency_error() from exc
                 if time.monotonic() - job.created_at >= max_inference_age:
                     raise latency_error()
                 if disconnected or job.generation != segmenter.generation:
                     continue
-                raw_text = text
-                if job.continuation:
-                    text = trim_overlap(previous_final, text)
+                hypothesis = from_result(result, job.start)
+                empty_result = not hypothesis.text
+                if empty_result and not job.final:
+                    continue
+                continuing = (job.continuation and previous_final is not None
+                              and previous_generation == job.generation)
+                if continuing:
+                    hypothesis = stitch(previous_final, hypothesis, job.start, previous_end)
+                else:
+                    caption_id, caption_start = job.id, job.start
+                # Empty continuation finals can retract a mistaken partial, but
+                # must not keep the preceding phrase alive as new speech.
+                if continuing and empty_result:
+                    expiry = previous_expiry
+                elif last_published and last_published[:2] == (caption_id, hypothesis.text):
+                    expiry = last_published[2]
+                else:
+                    expiry = time.time() + CAPTION_TTL
                 if job.final:
-                    previous_final = raw_text
+                    previous_final = hypothesis
+                    previous_end = job.end
+                    previous_generation = job.generation
+                    previous_expiry = expiry
                 event = {
                     "type": "transcription", "mode": "final" if job.final else "instant",
-                    "data": {"id": job.id, "text": text, "start": round(job.start, 3), "end": round(job.end, 3)},
+                    "data": {"id": caption_id, "text": hypothesis.text, "start": round(caption_start, 3), "end": round(job.end, 3)},
                     "metrics": {"inference_ms": round((time.perf_counter() - started) * 1000, 1),
+                                "queue_ms": round(queue_ms, 1),
                                 "audio_seconds": round(len(job.audio) / 16000, 3)},
-                    "expires_in_ms": int(CAPTION_TTL * 1000),
+                    "expires_in_ms": max(0, min(int(CAPTION_TTL * 1000), int((expiry - time.time()) * 1000))),
+                    "expires_at": expiry,
                 }
                 # Empty finals retract an earlier partial with the same ID.
-                if text or job.final:
+                if hypothesis.text or job.final:
+                    last_published = (caption_id, hypothesis.text, expiry)
                     app.state.hub.publish(event)
                     await ws.send_json(event)
 

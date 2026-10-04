@@ -14,6 +14,9 @@ def arguments():
     parser.add_argument("--list-devices", action="store_true", help="Lista mikrofoner utan att ladda modellen.")
     parser.add_argument("--device", help="Mikrofonens nummer eller del av namnet (standard: systemets mikrofon).")
     parser.add_argument("--threads", type=int, default=4, choices=range(1, 17), metavar="1–16", help="CPU-trådar, standard 4.")
+    parser.add_argument("--sensitivity", type=int, default=4, choices=range(1, 6), metavar="1–5", help="Mikrofonkänslighet: 5 fångar svagare tal, 1 filtrerar mer. Standard 4.")
+    parser.add_argument("--precision", choices=("int8", "fp16", "fp32"), default="int8", help="Modellprecision: int8 är snabbast; fp16/fp32 kräver större nedladdning.")
+    parser.add_argument("--diagnostics", action="store_true", help="Visa ljudnivå och beräkningstid i cmd, utan att spara ljud eller text.")
     parser.add_argument("--no-microphone", action="store_true", help="Starta server och modell utan mikrofon (för test).")
     parser.add_argument("--no-browser", action="store_true", help="Öppna inte webbläsaren (om du bara använder OBS).")
     return parser.parse_args()
@@ -68,7 +71,7 @@ async def run(args):
                 raise RuntimeError("Servern kunde inte starta på port 8000.")
             await asyncio.sleep(.025)
         print("OBS-webbläsarkälla: http://localhost:8000", flush=True)
-        print("Laddar Pianissimo. Första starten hämtar modellen; därefter används lokal cache.", flush=True)
+        print(f"Laddar Pianissimo ({args.precision}, CPU, {args.threads} trådar). Första starten hämtar modellen; därefter används lokal cache.", flush=True)
         service.start_load()
         await service.load_task
         if not service.model:
@@ -83,7 +86,8 @@ async def run(args):
                 return
             device = int(args.device) if args.device and args.device.isdecimal() else args.device
             try:
-                await capture_microphone(device, stop, lambda: app.state.hub.publish({"type": "clear"}))
+                await capture_microphone(device, stop, lambda: app.state.hub.publish({"type": "clear"}),
+                                         sensitivity=args.sensitivity, diagnostics=args.diagnostics)
             except Exception as exc:
                 app.state.hub.publish({"type": "clear"})
                 print(f"\nInspelningen stoppades: {exc}", file=sys.stderr, flush=True)
@@ -99,6 +103,7 @@ async def run(args):
 def main():
     args = arguments()
     os.environ["PIANISSIMO_THREADS"] = str(args.threads)
+    os.environ["PIANISSIMO_PRECISION"] = args.precision
     if args.list_devices:
         import sounddevice as sd
         default_input = sd.default.device[0]
